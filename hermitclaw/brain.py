@@ -14,6 +14,8 @@ from hermitclaw.prompts import main_system_prompt, REFLECTION_PROMPT, PLANNING_P
 from hermitclaw.providers import chat, chat_short
 from hermitclaw.tools import execute_tool, ensure_venv
 
+_USE_CLAUDE = config.get("provider") == "claude"
+
 logger = logging.getLogger("hermitclaw.brain")
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "hermitclaw.log.jsonl")
@@ -222,7 +224,7 @@ class Brain:
 
     async def _broadcast(self, message: dict):
         dead = set()
-        for ws in self._ws_clients:
+        for ws in list(self._ws_clients):
             try:
                 await ws.send_json(message)
             except Exception:
@@ -559,6 +561,13 @@ class Brain:
     # --- Think cycle ---
 
     async def _think_once(self):
+        """Dispatch to the right provider's think cycle."""
+        if _USE_CLAUDE:
+            await self._think_once_claude()
+        else:
+            await self._think_once_openai()
+
+    async def _think_once_openai(self):
         self.state = "thinking"
         await self._broadcast({"event": "status", "data": {"state": "thinking", "thought_count": self.thought_count}})
 
@@ -644,6 +653,222 @@ class Brain:
             except Exception as e:
                 logger.error(f"Memory add failed: {e}")
 
+    # --- Claude SDK think cycle ---
+
+    def _setup_claude_tools(self):
+        """Create MCP server with sandboxed tools for the Claude SDK."""
+        from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
+
+        brain = self  # closure reference
+
+        async def _shell_handler(args: dict) -> dict:
+            pre_files = brain._scan_env_files()
+            result = execute_tool("shell", {"command": args["command"]}, brain.env_path)
+            post_files = brain._scan_env_files()
+            brain._seen_env_files |= (post_files - pre_files)
+            return {"content": [{"type": "text", "text": result}]}
+
+        async def _respond_handler(args: dict) -> dict:
+            result = await brain._handle_respond({"message": args["message"]})
+            return {"content": [{"type": "text", "text": result}]}
+
+        async def _move_handler(args: dict) -> dict:
+            result = await brain._handle_move({"location": args["location"]})
+            return {"content": [{"type": "text", "text": result}]}
+
+        shell_tool = SdkMcpTool(
+            name="shell",
+            description=(
+                "Run a shell command inside your environment folder. "
+                "You can use ls, cat, mkdir, mv, cp, touch, echo, tee, find, grep, head, tail, wc, etc. "
+                "You can also run Python scripts: 'python script.py' or 'python -c \"code\"'. "
+                "Use 'cat > file.txt << EOF' or 'echo ... > file.txt' to write files. "
+                "Create folders with mkdir. All paths are relative to your environment root."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run"}
+                },
+                "required": ["command"],
+            },
+            handler=_shell_handler,
+        )
+
+        respond_tool = SdkMcpTool(
+            name="respond",
+            description=(
+                "Talk to your owner! Use this whenever you hear their voice and want to "
+                "reply. After you speak, they might say something back — if they do, "
+                "use respond AGAIN to keep the conversation going."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "What you say back to them"}
+                },
+                "required": ["message"],
+            },
+            handler=_respond_handler,
+        )
+
+        move_tool = SdkMcpTool(
+            name="move",
+            description=(
+                "Move to a location in your room. Use this to go where feels natural "
+                "for what you're doing — desk for writing, bookshelf for research, "
+                "window for pondering, bed for resting."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "enum": ["desk", "bookshelf", "window", "plant", "bed", "rug", "center"],
+                    }
+                },
+                "required": ["location"],
+            },
+            handler=_move_handler,
+        )
+
+        self._claude_mcp_server = create_sdk_mcp_server(
+            "hermitclaw", tools=[shell_tool, respond_tool, move_tool]
+        )
+
+    async def _think_once_claude(self):
+        """Single think cycle using Claude Agent SDK.
+
+        Runs query() directly in the main event loop so MCP tool handlers
+        (especially respond) can interact with WebSocket clients.
+        """
+        from claude_agent_sdk import query, ClaudeAgentOptions
+        from hermitclaw.providers_claude import refresh_oauth_token, cleanup_transcript
+
+        self.state = "thinking"
+        await self._broadcast({"event": "status", "data": {"state": "thinking", "thought_count": self.thought_count}})
+
+        # Refresh OAuth token
+        access_token = refresh_oauth_token()
+        if access_token:
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
+
+        # Build input
+        instructions, input_list = self._build_input()
+
+        # Convert input_list to a text prompt (SDK takes a string, not structured messages)
+        prompt_parts = []
+        for item in input_list:
+            if isinstance(item, dict):
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    prompt_parts.append(content)
+                elif isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "input_text":
+                            prompt_parts.append(c["text"])
+                        elif isinstance(c, dict) and c.get("type") == "input_image":
+                            prompt_parts.append("(image attached — use shell tool to inspect files)")
+        prompt = "\n\n".join(prompt_parts)
+
+        # Setup tools if not done yet
+        if not hasattr(self, "_claude_mcp_server"):
+            self._setup_claude_tools()
+
+        # Build async iterable prompt (required for SDK MCP servers — string
+        # prompts close stdin before MCP tool calls can be handled)
+        async def _prompt_messages():
+            yield {
+                "type": "user",
+                "session_id": "",
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            }
+
+        # Run the SDK query directly in the main event loop
+        text_parts = []
+        sdk_session_id = None
+
+        try:
+            async for msg in query(
+                prompt=_prompt_messages(),
+                options=ClaudeAgentOptions(
+                    model=config.get("claude_model", "claude-opus-4-5-20251101"),
+                    system_prompt=instructions,
+                    mcp_servers={"hermitclaw": self._claude_mcp_server},
+                    allowed_tools=[
+                        "mcp__hermitclaw__shell",
+                        "mcp__hermitclaw__respond",
+                        "mcp__hermitclaw__move",
+                        "WebSearch",
+                    ],
+                    permission_mode="bypassPermissions",
+                    max_turns=10,
+                )
+            ):
+                # Collect text from content blocks
+                if hasattr(msg, "content"):
+                    for block in msg.content:
+                        if hasattr(block, "text") and block.text:
+                            text_parts.append(block.text)
+                        # Emit tool use events for frontend visualization
+                        if hasattr(block, "type") and block.type == "tool_use":
+                            tool_name = getattr(block, "name", "unknown")
+                            tool_args = getattr(block, "input", {})
+                            await self._emit("tool_call", tool=tool_name, args=tool_args)
+                            activity = self._classify_activity(tool_name, tool_args)
+                            await self._broadcast({"event": "activity", "data": activity})
+                        if hasattr(block, "type") and block.type == "tool_result":
+                            tool_text = ""
+                            if hasattr(block, "content"):
+                                for c in (block.content if isinstance(block.content, list) else [block.content]):
+                                    if hasattr(c, "text"):
+                                        tool_text = c.text
+                            await self._emit("tool_result", tool="", output=tool_text[:500])
+                            await self._broadcast({"event": "activity", "data": {"type": "idle", "detail": ""}})
+                # Capture session_id for cleanup
+                if hasattr(msg, "session_id"):
+                    sdk_session_id = msg.session_id
+
+        except Exception as e:
+            logger.error(f"Claude SDK call failed: {e}")
+            await self._emit("error", text=str(e))
+            if sdk_session_id:
+                cleanup_transcript(sdk_session_id)
+            return
+
+        # Clean up SDK transcript
+        cleanup_transcript(sdk_session_id)
+
+        # Emit the final thought
+        final_text = "".join(text_parts)
+        if final_text:
+            self.thought_count += 1
+            await self._emit("thought", text=final_text)
+
+            # Log as API call for frontend/logging compatibility
+            api_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "instructions": instructions[:500],
+                "input": _serialize_input(input_list),
+                "output": [{"type": "message", "content": [{"type": "text", "text": final_text}]}],
+                "is_dream": False,
+                "is_planning": False,
+            }
+            self.api_calls.append(api_entry)
+            await self._broadcast({"event": "api_call", "data": api_entry})
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(json.dumps(api_entry) + "\n")
+            except Exception:
+                pass
+
+            # Store in memory stream
+            try:
+                await asyncio.to_thread(self.stream.add, final_text, "thought")
+            except Exception as e:
+                logger.error(f"Memory add failed: {e}")
+
     # --- Reflection ---
 
     async def _reflect(self):
@@ -665,11 +890,11 @@ class Brain:
 
         reflect_input = [{"role": "user", "content": f"Your recent memories:\n\n{memories_text}"}]
         try:
-            reflect_response = await asyncio.to_thread(
-                chat, reflect_input, False, REFLECTION_PROMPT
+            reflection_text = await asyncio.to_thread(
+                chat_short, reflect_input, REFLECTION_PROMPT
             )
+            reflect_response = {"text": reflection_text, "output": []}
             await self._emit_api_call(REFLECTION_PROMPT, reflect_input, reflect_response, is_reflection=True)
-            reflection_text = reflect_response["text"] or ""
         except Exception as e:
             logger.error(f"Reflection failed: {e}")
             await self._emit("error", text=f"Reflection failed: {e}")
@@ -718,11 +943,11 @@ class Brain:
 {memories_text}"""}]
 
         try:
-            plan_response = await asyncio.to_thread(
-                chat, plan_input, False, PLANNING_PROMPT
+            plan_text = await asyncio.to_thread(
+                chat_short, plan_input, PLANNING_PROMPT
             )
+            plan_response = {"text": plan_text, "output": []}
             await self._emit_api_call(PLANNING_PROMPT, plan_input, plan_response, is_planning=True)
-            plan_text = plan_response["text"] or ""
         except Exception as e:
             logger.error(f"Planning failed: {e}")
             await self._emit("error", text=f"Planning failed: {e}")

@@ -17,6 +17,8 @@ def load_config() -> dict:
         or config.get("api_key")
     )
     config["model"] = os.environ.get("HERMITCLAW_MODEL") or config.get("model", "gpt-4o")
+    config["provider"] = os.environ.get("HERMITCLAW_PROVIDER") or config.get("provider", "openai")
+    config.setdefault("claude_model", "claude-opus-4-5-20251101")
 
     # Defaults for numeric settings
     config.setdefault("thinking_pace_seconds", 45)
